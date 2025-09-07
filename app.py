@@ -75,6 +75,15 @@ def _safe_float(x) -> Optional[float]:
     except Exception:
         return None
 
+def _fmt_pct(x: Optional[float]) -> str:
+    return "" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:.0f}%"
+
+def _fmt_int(x: Optional[int]) -> str:
+    return "" if x is None else f"{int(x)}"
+
+def _fmt_kg(x: Optional[float]) -> str:
+    return "" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:.1f} kg"
+
 def _round_weight(kg: float, step: float, mode: str) -> float:
     if step <= 0:
         return round(kg, 1)
@@ -187,7 +196,8 @@ def _compute_e1rm(df: pd.DataFrame, lookback_weeks: int) -> pd.DataFrame:
     last_date = df["Date"].max()
     cutoff = last_date - pd.Timedelta(weeks=int(lookback_weeks))
     sub = df[df["Date"] >= cutoff].copy()
-
+    # filter incomplete rijen
+    sub = sub.dropna(subset=["Weight", "Reps"])
     sub["est_1rm"] = _epley_1rm(sub["Weight"].astype(float), sub["Reps"].astype(int))
     agg = sub.groupby("Exercise", as_index=False)["est_1rm"].max().rename(columns={"est_1rm": "e1RM"})
     return agg
@@ -237,9 +247,7 @@ advice_df = None
 if advice_xlsx is not None:
     advice_df = _read_advice_xlsx(advice_xlsx)
 
-# Voorbeeld: je bestaande template voor de "volgende sessie".
-# In veel implementaties wordt dit al elders afgeleid. Hier construeren we een minimale template
-# uit de meest recente training per oefening: 3 sets default, reps = laatst uitgevoerde reps.
+# Basistemplate (voorbeeld): laatste uitvoering per oefening ⇒ 3 sets default
 last_by_ex = df_strong.sort_values("Date").groupby("Exercise", as_index=False).tail(1)
 template_rows = []
 for r in last_by_ex.itertuples(index=False):
@@ -248,10 +256,9 @@ for r in last_by_ex.itertuples(index=False):
             "Workout": default_workout_name,
             "Exercise": getattr(r, "Exercise"),
             "SetNumber": s,
-            # optioneel gevuld in jouw data:
-            "MuscleGroup": "",          # kan door jou worden gevuld
-            "LoadStatus": "ok",         # "low"/"ok"/"high" — placeholder
-            "Sets": 3                   # default sets per oefening (kan overridden worden)
+            "MuscleGroup": "",          # optioneel te vullen
+            "LoadStatus": "ok",         # "low"/"ok"/"high"
+            "Sets": 3                   # default sets
         })
 template = pd.DataFrame(template_rows)
 
@@ -283,9 +290,6 @@ for r in template.itertuples(index=False):
         fb_pct, fb_reps, fb_sets = _apply_fallback(pd.Series(r._asdict()), fallback_matrix)
         pct = fb_pct if pct is None else pct
         reps = fb_reps if reps is None else reps
-        # neem fb_sets als default voor Sets (alleen informatief)
-        if fb_sets is not None and "Sets" in template.columns:
-            pass
 
     # Veiligheidsmarge op %1RM
     if pct is not None and safety_delta != 0.0:
@@ -406,7 +410,6 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # ---------- Render ----------
 # ==============================
 
-# Groepeer per oefening binnen workout
 if plan_disp.empty:
     st.warning("Geen adviesregels beschikbaar.")
     st.stop()
@@ -427,34 +430,32 @@ for ex, grp in plan_disp.groupby("Exercise", sort=False):
     grp = grp.sort_values("SetNumber")
     e1 = grp["e1RM"].dropna().max()
     header = f"{ex}  "
-    sub = f"(e1RM: {e1:.1f} kg)" if e1 is not None and not np.isnan(e1) else "(e1RM: onbekend)"
+    sub = f"(e1RM: {e1:.1f} kg)" if isinstance(e1, (int, float)) and not np.isnan(e1) else "(e1RM: onbekend)"
     st.markdown(f"<div class='section-title'>{header}<span class='badge'>{sub}</span></div>", unsafe_allow_html=True)
     st.markdown("<div class='exercise-card'>", unsafe_allow_html=True)
 
-    # Grid van set-kaarten
+    # Grid van set-kaarten — LET OP: iterrows i.p.v. itertuples om '%1RM' veilig te lezen
     st.markdown("<div class='set-grid'>", unsafe_allow_html=True)
-    for r in grp.itertuples(index=False):
-        pct = getattr(r, "_1RM") if hasattr(r, "_1RM") else getattr(r, "%1RM")
-        reps = getattr(r, "Reps")
-        tgt = getattr(r, "TargetKg")
-        setn = getattr(r, "SetNumber")
+    for _, rr in grp.iterrows():
+        pct = _safe_float(rr.get("%1RM"))
+        reps = _safe_int(rr.get("Reps"))
+        tgt = _safe_float(rr.get("TargetKg"))
+        setn = _safe_int(rr.get("SetNumber"))
 
-        # Kaart
         st.markdown("<div class='set-card'>", unsafe_allow_html=True)
-        st.markdown(f"<div class='set-header'>Set {int(setn)}</div>", unsafe_allow_html=True)
-        # key-values
+        st.markdown(f"<div class='set-header'>Set {'' if setn is None else int(setn)}</div>", unsafe_allow_html=True)
+
         st.markdown("<div class='kv'>", unsafe_allow_html=True)
         st.markdown("<div class='k'>%1RM</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='v'>{'' if pct is None else f'{pct:.0f}%'}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='v'>{_fmt_pct(pct)}</div>", unsafe_allow_html=True)
         st.markdown("<div class='k'>Reps</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='v'>{'' if reps is None else int(reps)}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='v'>{_fmt_int(reps)}</div>", unsafe_allow_html=True)
         st.markdown("<div class='k'>Doel-kg</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='v'>{'' if tgt is None or np.isnan(tgt) else f'{tgt:.1f} kg'}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='v'>{_fmt_kg(tgt)}</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)  # kv
 
-        # Optionele hints/warm-ups
-        if show_warmups and (tgt is not None) and (tgt > 0):
-            # simpele ladder naar ~85%, 70%, 50% van doel
+        # Optionele warm-ups
+        if show_warmups and (tgt is not None) and not (isinstance(tgt, float) and np.isnan(tgt)) and tgt > 0:
             w3 = _round_weight(tgt * 0.85, kg_step, round_mode)
             w2 = _round_weight(tgt * 0.70, kg_step, round_mode)
             w1 = _round_weight(max(bar_weight, tgt * 0.50), kg_step, round_mode)
@@ -471,7 +472,6 @@ for ex, grp in plan_disp.groupby("Exercise", sort=False):
 # ==============================
 
 with st.expander("Exporteren"):
-    # Exporteer het plan in 'platte' vorm als CSV voor logging/controle
     exp = plan_disp.copy()
     exp = exp[["Workout","Exercise","SetNumber","%1RM","Reps","TargetKg","e1RM","SetsOverride"]]
     csv_bytes = exp.to_csv(index=False).encode("utf-8")
