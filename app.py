@@ -50,19 +50,18 @@ with st.expander("Weergave & berekening — instellingen", expanded=True):
 
     col_s8, col_s9 = st.columns(2)
     with col_s8:
-        use_global_defaults = st.checkbox("Gebruik defaults als geen advies/fallback", value=True,
-                                          help="Zet %1RM=70 en Reps=8 als er geen match of fallback is.")
+        use_global_defaults = st.checkbox(
+            "Gebruik defaults als geen advies/fallback",
+            value=True,
+            help="Zet %1RM=70 en Reps=8 als er geen match of fallback is.",
+        )
     with col_s9:
         show_debug = st.checkbox("Toon debug-diagnostiek", value=False)
 
 with st.expander("Workouts plannen (in-app) — optioneel", expanded=False):
     use_inapp = st.checkbox("Gebruik handmatige planner", value=False)
     planner_df = pd.DataFrame()
-    if use_inapp:
-        st.markdown(
-            "Voeg regels toe: **Workout** (tekst), **Exercise** (selecteer), **Sets** (aantal). "
-            "Je selectie krijgt voorrang op Excel en default."
-        )
+    apply_plan = False  # default; wordt true na button-click indien use_inapp
 
 # ==============================
 # ---------- Helpers ----------
@@ -142,17 +141,28 @@ def _read_strong_csv(file) -> pd.DataFrame:
     df["ISO_Year"], df["ISO_Week"] = zip(*df["Date"].map(_isocalendar_tuple))
     return df
 
-def _read_sheet(upload, sheet: str) -> Optional[pd.DataFrame]:
+# ---------- Excel readers (op 1 buffer) ----------
+
+def _read_excel_bytes(upload) -> Optional[bytes]:
+    if upload is None:
+        return None
     try:
-        b = upload.read()
-        xls = io.BytesIO(b)
-        df = pd.read_excel(xls, sheet_name=sheet, engine="openpyxl")
-        return df
-    except ValueError:
+        return upload.read()
+    except Exception:
         return None
 
-def _read_advice_xlsx(upload) -> Optional[pd.DataFrame]:
-    df = _read_sheet(upload, "advice")
+def _read_sheet_from_bytes(file_bytes: Optional[bytes], sheet: str) -> Optional[pd.DataFrame]:
+    if not file_bytes:
+        return None
+    try:
+        return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, engine="openpyxl")
+    except ValueError:
+        return None  # sheet bestaat niet
+    except ModuleNotFoundError:
+        st.error("Openen van .xlsx vereist **openpyxl**. Installeer met `pip install openpyxl`.")
+        st.stop()
+
+def _prep_advice_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
     if df is None:
         return None
     for c in ["ISO_Year", "ISO_Week", "Workout", "Exercise", "SetNumber", "%1RM", "Reps", "SetsOverride"]:
@@ -176,8 +186,7 @@ def _read_advice_xlsx(upload) -> Optional[pd.DataFrame]:
     df["SetsOverride"] = df["SetsOverride"].map(_safe_int)
     return df
 
-def _read_workouts_xlsx(upload) -> Optional[pd.DataFrame]:
-    df = _read_sheet(upload, "workouts")
+def _prep_workouts_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
     if df is None:
         return None
     for c in ["Workout", "Exercise", "Sets", "ISO_Year", "ISO_Week"]:
@@ -188,18 +197,23 @@ def _read_workouts_xlsx(upload) -> Optional[pd.DataFrame]:
     df["Sets"] = df["Sets"].map(_safe_int).fillna(3)
     df["ISO_Year"] = df["ISO_Year"].map(_safe_int)
     df["ISO_Week"] = df["ISO_Week"].map(_safe_int)
-    # Expandeer per oefening naar individuele SetNumber regels
+    # Expand naar individuele set-rijen
     rows = []
     for r in df.itertuples(index=False):
-        for s in range(1, int(getattr(r, "Sets") or 0) + 1):
-            rows.append({
-                "Workout": getattr(r, "Workout"),
-                "Exercise": getattr(r, "Exercise"),
-                "SetNumber": s,
-                "ISO_Year": getattr(r, "ISO_Year"),
-                "ISO_Week": getattr(r, "ISO_Week")
-            })
-    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["Workout","Exercise","SetNumber","ISO_Year","ISO_Week"])
+        n = int(getattr(r, "Sets") or 0)
+        for s in range(1, n + 1):
+            rows.append(
+                {
+                    "Workout": getattr(r, "Workout"),
+                    "Exercise": getattr(r, "Exercise"),
+                    "SetNumber": s,
+                    "ISO_Year": getattr(r, "ISO_Year"),
+                    "ISO_Week": getattr(r, "ISO_Week"),
+                }
+            )
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["Workout", "Exercise", "SetNumber", "ISO_Year", "ISO_Week"])
+
+# ---------- Matching & targets ----------
 
 def _best_match(adf: Optional[pd.DataFrame],
                 iso_year: Optional[int],
@@ -285,17 +299,21 @@ if strong_file is None:
 df_strong = _read_strong_csv(strong_file)
 ref_tbl = _compute_strength_reference(df_strong, lookback_weeks)
 
-advice_df = _read_advice_xlsx(advice_xlsx) if advice_xlsx is not None else None
-workouts_plan = _read_workouts_xlsx(advice_xlsx) if advice_xlsx is not None else None
+# Lees Excel één keer in geheugen; hergebruik voor beide tabs
+file_bytes = _read_excel_bytes(advice_xlsx)
+advice_raw = _read_sheet_from_bytes(file_bytes, "advice")
+workouts_raw = _read_sheet_from_bytes(file_bytes, "workouts")
 
-# In-app planner (optioneel)
+advice_df = _prep_advice_df(advice_raw) if advice_raw is not None else None
+workouts_plan = _prep_workouts_df(workouts_raw) if workouts_raw is not None else None
+
+# In-app planner (optioneel, zonder haakjes-mismatch)
 if use_inapp:
-    # opties voor Exercise uit je Strong
     exercises_list = sorted(df_strong["Exercise"].dropna().unique().tolist())
     default_rows = pd.DataFrame({
-        "Workout": [default_workout_name]*3,
-        "Exercise": exercises_list[:3] if len(exercises_list)>=3 else exercises_list,
-        "Sets": [3]*min(3, len(exercises_list))
+        "Workout": [default_workout_name] * min(3, len(exercises_list) if exercises_list else 0),
+        "Exercise": exercises_list[:3] if exercises_list else [],
+        "Sets": [3] * min(3, len(exercises_list) if exercises_list else 0),
     })
     planner_df = st.data_editor(
         default_rows,
@@ -304,33 +322,25 @@ if use_inapp:
         column_config={
             "Workout": st.column_config.TextColumn("Workout"),
             "Exercise": st.column_config.SelectboxColumn("Exercise", options=exercises_list, required=True),
-            "Sets": st.column_config.NumberColumn("Sets", min_value=1, max_value=10, step=1, required=True)
-        ],
-        key="planner_editor"
+            "Sets": st.column_config.NumberColumn("Sets", min_value=1, max_value=10, step=1, required=True),
+        },
+        key="planner_editor",
     )
     apply_plan = st.button("Plan toepassen")
-else:
-    apply_plan = False
 
 # ---- Template bouwen (prioriteit): In-app plan → Excel workouts → default laatste sessies ----
-template = None
-
 if use_inapp and apply_plan and not planner_df.empty:
     rows = []
     for r in planner_df.itertuples(index=False):
         w = str(getattr(r, "Workout") or default_workout_name)
         ex = str(getattr(r, "Exercise"))
         n = int(getattr(r, "Sets") or 0)
-        for s in range(1, n+1):
+        for s in range(1, n + 1):
             rows.append({"Workout": w, "Exercise": ex, "SetNumber": s})
     template = pd.DataFrame(rows)
-
 elif workouts_plan is not None and not workouts_plan.empty:
-    # Als ISO_Year/Week in plan staan en afwijken van vandaag, we negeren dat hier (matching gebeurt later)
-    template = workouts_plan[["Workout","Exercise","SetNumber"]].copy()
-
+    template = workouts_plan[["Workout", "Exercise", "SetNumber"]].copy()
 else:
-    # fallback: laatste uitvoering per oefening ⇒ default 3 sets
     last_by_ex = df_strong.sort_values("Date").groupby("Exercise", as_index=False).tail(1)
     rows = []
     for r in last_by_ex.itertuples(index=False):
@@ -346,16 +356,12 @@ today = datetime.now()
 isoY, isoW = today.isocalendar().year, today.isocalendar().week
 
 out_rows = []
-matched_count = 0
-
 for _, row in template.iterrows():
     ex = str(row["Exercise"])
     setno = int(row["SetNumber"])
     workout = str(row["Workout"])
 
     match = _best_match(advice_df, isoY, isoW, workout, ex, setno) if advice_df is not None else None
-    if match is not None:
-        matched_count += 1
 
     pct = _coerce_pct(match["%1RM"]) if match is not None else None
     reps = _safe_int(match["Reps"]) if match is not None else None
@@ -382,7 +388,7 @@ for _, row in template.iterrows():
         "e1RM": e1rm_choice,
         "last_nz_weight": last_nz,
         "SetsOverride": sets_override,
-        "_Matched": match is not None
+        "_Matched": match is not None,
     })
 
 plan = pd.DataFrame(out_rows)
@@ -400,7 +406,7 @@ def _apply_sets_override_to_display(df: pd.DataFrame) -> pd.DataFrame:
         else:
             if len(g) > 0:
                 last = g.iloc[-1].to_dict()
-                for s in range(len(g)+1, n_sets+1):
+                for s in range(len(g) + 1, n_sets + 1):
                     last["SetNumber"] = s
                     g = pd.concat([g, pd.DataFrame([last])], ignore_index=True)
         out.append(g)
@@ -548,9 +554,9 @@ for ex, grp in plan_disp.groupby("Exercise", sort=False):
             st.markdown("<div class='hint'><b>Warm-up</b>: "
                         f"{w1:.1f} × 5  →  {w2:.1f} × 3  →  {w3:.1f} × 1–2</div>", unsafe_allow_html=True)
 
-        st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)  # set-card
+    st.markdown("</div>", unsafe_allow_html=True)  # set-grid
+    st.markdown("</div>", unsafe_allow_html=True)  # exercise-card
 
 # ==============================
 # ---------- Export & Debug ----------
@@ -558,7 +564,7 @@ for ex, grp in plan_disp.groupby("Exercise", sort=False):
 
 with st.expander("Exporteren"):
     exp = plan_disp.copy()
-    exp = exp[["Workout","Exercise","SetNumber","%1RM","Reps","TargetKg","e1RM","last_nz_weight","SetsOverride"]]
+    exp = exp[["Workout", "Exercise", "SetNumber", "%1RM", "Reps", "TargetKg", "e1RM", "last_nz_weight", "SetsOverride"]]
     csv_bytes = exp.to_csv(index=False).encode("utf-8")
     st.download_button("Download voorstel als CSV", data=csv_bytes, file_name="coaching_voorstel.csv", mime="text/csv")
 
