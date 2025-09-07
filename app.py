@@ -1,5 +1,5 @@
 # app.py
-# Periodization Coach — kaart-/blokweergave + robuuste Advies-Excel matching
+# Periodization Coach — kaartenweergave met robuuste target-berekening
 # Vereist: streamlit, pandas, numpy. Optioneel: openpyxl (voor .xlsx inlezen)
 
 import io
@@ -20,7 +20,7 @@ st.set_page_config(page_title="Periodization Coach — Kaartenweergave", layout=
 st.title("Next Workout — Coachingvoorstel (Kaartenweergave)")
 st.caption(
     "Upload je Strong-export (CSV). Optioneel: Advies-Excel (tab **advice**) met `%1RM`, `Reps`, `SetsOverride`. "
-    "Resultaat toont per oefening grote blokken per set met %1RM, reps en doel-kg."
+    "Per oefening tonen we grote blokken per set met %1RM, reps en doel-kg."
 )
 
 col_u1, col_u2 = st.columns(2)
@@ -51,7 +51,7 @@ with st.expander("Weergave & berekening — instellingen", expanded=True):
     col_s8, col_s9 = st.columns(2)
     with col_s8:
         use_global_defaults = st.checkbox("Gebruik defaults als geen advies/fallback", value=True,
-                                          help="Zet %1RM=70 en Reps=8 als er geen match is en er geen fallback-matrix beschikbaar is.")
+                                          help="Zet %1RM=70 en Reps=8 als er geen match of fallback is.")
     with col_s9:
         show_debug = st.checkbox("Toon debug-diagnostiek", value=False)
 
@@ -175,7 +175,7 @@ def _best_match(adf: pd.DataFrame,
                 workout: str,
                 exercise: str,
                 setno: Optional[int]) -> Optional[pd.Series]:
-    """Zoek beste match met aflopende strengheid; accepteer exercise-only ook als Workout in Excel wél gevuld is."""
+    """Beste match met aflopende strengheid; accepteer exercise(+set) ook als Workout in Excel wél gevuld is."""
     if adf is None or adf.empty:
         return None
     w = _norm(workout)
@@ -189,7 +189,7 @@ def _best_match(adf: pd.DataFrame,
             sub = sub.sort_values(by=["spec", "recency"], ascending=[False, False], kind="mergesort")
             picks.append(sub.iloc[0])
 
-    # Strikte lagen (zoals eerder)
+    # Strikte lagen
     pick((adf["ISO_Year_int"] == iso_year) & (adf["ISO_Week_int"] == iso_week) &
          (adf["Workout_norm"] == w) & (adf["Exercise_norm"] == e) & (adf["SetNumber_int"] == s))
     pick((adf["ISO_Year_int"] == iso_year) & (adf["ISO_Week_int"] == iso_week) &
@@ -201,30 +201,69 @@ def _best_match(adf: pd.DataFrame,
     pick(adf["ISO_Year_int"].isna() & adf["ISO_Week_int"].isna() &
          (adf["Workout_norm"] == w) & (adf["Exercise_norm"] == e) & adf["SetNumber_int"].isna())
 
-    # Losser: negeer Workout-waarde voor exercise(+set)
+    # Losser: negeer Workout voor exercise(+set)
     pick((adf["Exercise_norm"] == e) & (adf["SetNumber_int"] == s))
     pick((adf["Exercise_norm"] == e) & adf["SetNumber_int"].isna())
 
     return picks[0] if picks else None
 
-def _compute_e1rm(df: pd.DataFrame, lookback_weeks: int) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=["Exercise", "e1RM"])
+# ---------- e1RM & targets ----------
+
+def _compute_strength_reference(df: pd.DataFrame, lookback_weeks: int) -> pd.DataFrame:
+    """
+    Bouw referentietabel per oefening:
+    - e1RM_recent: beste Epley in laatste N weken (Weight>0, Reps>0)
+    - e1RM_all: beste Epley in alle data (Weight>0, Reps>0)
+    - last_nz_weight: laatste niet-nul Weight
+    """
+    def e1rm_table(sub: pd.DataFrame) -> pd.DataFrame:
+        sub = sub.dropna(subset=["Weight", "Reps"])
+        sub = sub[(sub["Weight"] > 0) & (sub["Reps"] > 0)].copy()
+        if sub.empty:
+            return pd.DataFrame(columns=["Exercise", "e1RM"])
+        sub["est_1rm"] = _epley_1rm(sub["Weight"].astype(float), sub["Reps"].astype(int))
+        return sub.groupby("Exercise", as_index=False)["est_1rm"].max().rename(columns={"est_1rm": "e1RM"})
+
+    # Recent
     last_date = df["Date"].max()
     cutoff = last_date - pd.Timedelta(weeks=int(lookback_weeks))
-    sub = df[df["Date"] >= cutoff].copy()
-    sub = sub.dropna(subset=["Weight", "Reps"])
-    # filter bodyweight (Weight==0) uit voor e1RM
-    sub = sub[(sub["Weight"] > 0) & (sub["Reps"] > 0)]
-    sub["est_1rm"] = _epley_1rm(sub["Weight"].astype(float), sub["Reps"].astype(int))
-    agg = sub.groupby("Exercise", as_index=False)["est_1rm"].max().rename(columns={"est_1rm": "e1RM"})
-    return agg
+    recent = df[df["Date"] >= cutoff].copy()
+    e_recent = e1rm_table(recent).rename(columns={"e1RM": "e1RM_recent"})
 
-def _calc_target_weight(e1rm: Optional[float], pct: Optional[float], step: float, mode: str) -> Optional[float]:
-    if e1rm is None or pct is None:
+    # All-time
+    e_all = e1rm_table(df).rename(columns={"e1RM": "e1RM_all"})
+
+    # Last non-zero weight
+    nz = df[df["Weight"] > 0].sort_values("Date").groupby("Exercise", as_index=False).tail(1)
+    nz = nz[["Exercise", "Weight"]].rename(columns={"Weight": "last_nz_weight"})
+
+    ref = pd.merge(e_recent, e_all, on="Exercise", how="outer")
+    ref = pd.merge(ref, nz, on="Exercise", how="outer")
+    return ref
+
+def _choose_e1rm(row: pd.Series) -> Optional[float]:
+    """Kies e1RM in volgorde: recent → all-time; zo niet: None"""
+    e_recent = _safe_float(row.get("e1RM_recent"))
+    e_all = _safe_float(row.get("e1RM_all"))
+    return e_recent if (e_recent is not None and not np.isnan(e_recent)) else e_all
+
+def _calc_target(e1rm: Optional[float], pct: Optional[float], last_nz: Optional[float],
+                 step: float, mode: str) -> Optional[float]:
+    """
+    Target logica:
+    1) Als e1RM beschikbaar en pct → round(e1RM * pct)
+    2) Anders, als last_nz beschikbaar en pct → round(last_nz * pct)  [conservatief]
+    3) Anders None
+    """
+    if pct is None:
         return None
-    raw = e1rm * (pct / 100.0)
-    return _round_weight(raw, step, mode)
+    if e1rm is not None and not np.isnan(e1rm) and e1rm > 0:
+        raw = e1rm * (pct / 100.0)
+        return _round_weight(raw, step, mode)
+    if last_nz is not None and not np.isnan(last_nz) and last_nz > 0:
+        raw = last_nz * (pct / 100.0)
+        return _round_weight(raw, step, mode)
+    return None
 
 # ==============================
 # ---------- Pipeline ----------
@@ -235,7 +274,7 @@ if strong_file is None:
     st.stop()
 
 df_strong = _read_strong_csv(strong_file)
-e1rm_tbl = _compute_e1rm(df_strong, lookback_weeks)
+ref_tbl = _compute_strength_reference(df_strong, lookback_weeks)
 
 advice_df = None
 if advice_xlsx is not None:
@@ -245,7 +284,7 @@ if advice_xlsx is not None:
 last_by_ex = df_strong.sort_values("Date").groupby("Exercise", as_index=False).tail(1)
 template_rows = []
 for r in last_by_ex.itertuples(index=False):
-    for s in range(1, 4):  # default 3 sets
+    for s in range(1, 3 + 1):  # default 3 sets
         template_rows.append({
             "Workout": default_workout_name,
             "Exercise": getattr(r, "Exercise"),
@@ -253,7 +292,9 @@ for r in last_by_ex.itertuples(index=False):
             "Sets": 3
         })
 template = pd.DataFrame(template_rows)
-template = template.merge(e1rm_tbl, on="Exercise", how="left")
+
+# Merge referenties
+template = template.merge(ref_tbl, on="Exercise", how="left")
 
 # Advies-matching
 today = datetime.now()
@@ -275,17 +316,19 @@ for _, row in template.iterrows():
     reps = _safe_int(match["Reps"]) if match is not None else None
     sets_override = _safe_int(match["SetsOverride"]) if match is not None else None
 
-    # Veiligheidsmarge op %1RM
-    if pct is not None and safety_delta != 0.0:
-        pct = max(0.0, pct + float(safety_delta))
-
     # Defaults als alles faalt (optioneel)
     if (pct is None or reps is None) and use_global_defaults:
         pct = 70.0 if pct is None else pct
         reps = 8 if reps is None else reps
 
-    e1 = _safe_float(row.get("e1RM"))
-    tgt_kg = _calc_target_weight(e1, pct, kg_step, round_mode) if (e1 is not None and pct is not None) else None
+    # Veiligheidsmarge op %1RM
+    if pct is not None and safety_delta != 0.0:
+        pct = max(0.0, pct + float(safety_delta))
+
+    # Doel-kg: met extra fallbacks
+    e1rm_choice = _choose_e1rm(row)
+    last_nz = _safe_float(row.get("last_nz_weight"))
+    tgt_kg = _calc_target(e1rm_choice, pct, last_nz, kg_step, round_mode)
 
     out_rows.append({
         "Workout": workout,
@@ -294,7 +337,8 @@ for _, row in template.iterrows():
         "%1RM": pct,
         "Reps": reps,
         "TargetKg": tgt_kg,
-        "e1RM": e1,
+        "e1RM": e1rm_choice,
+        "last_nz_weight": last_nz,
         "SetsOverride": sets_override,
         "_Matched": match is not None
     })
@@ -332,44 +376,56 @@ plan_disp = _apply_sets_override_to_display(plan)
 CUSTOM_CSS = """
 <style>
 .section-title {
-    margin-top: 0.5rem;
+    margin-top: 0.75rem;
     margin-bottom: 0.25rem;
     font-size: 1.25rem;
     font-weight: 700;
 }
 .exercise-card {
-    padding: 0.75rem 1rem;
-    margin: 0.25rem 0 0.75rem 0;
-    border-radius: 12px;
+    padding: 1rem;
+    margin: 0.25rem 0 1rem 0;
+    border-radius: 14px;
     border: 1px solid rgba(120,120,120,0.25);
-    background: linear-gradient(180deg, rgba(250,250,250,0.9), rgba(245,245,245,0.9));
+    background: linear-gradient(180deg, rgba(250,250,250,0.95), rgba(242,242,242,0.95));
 }
 .set-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-    gap: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 14px;
 }
 .set-card {
     border: 1px solid rgba(100,100,100,0.25);
     border-radius: 12px;
     padding: 14px;
     background: #ffffff;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
 }
 .set-header {
     font-weight: 700;
-    font-size: 0.95rem;
-    margin-bottom: 6px;
+    font-size: 1rem;
+    margin-bottom: 10px;
 }
-.kv {
+.pill-row {
     display: grid;
-    grid-template-columns: 1fr auto;
-    row-gap: 6px;
-    column-gap: 12px;
-    font-size: 0.95rem;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
 }
-.kv .k { color: #555; }
-.kv .v { font-weight: 700; }
+.pill {
+    border: 1px solid rgba(0,0,0,0.1);
+    border-radius: 10px;
+    padding: 10px 12px;
+    background: #fafafa;
+}
+.pill .label {
+    font-size: 0.75rem;
+    color: #666;
+    margin-bottom: 4px;
+}
+.pill .value {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: #111;
+}
 .badge {
     display: inline-block;
     padding: 2px 8px;
@@ -381,14 +437,14 @@ CUSTOM_CSS = """
     border: 1px solid #cfe4ff;
 }
 .hint {
-    margin-top: 8px;
+    margin-top: 10px;
     font-size: 0.8rem;
     color: #666;
 }
 .divider {
     height: 1px;
     background: rgba(0,0,0,0.07);
-    margin: 8px 0 12px 0;
+    margin: 10px 0 12px 0;
 }
 </style>
 """
@@ -435,14 +491,20 @@ for ex, grp in plan_disp.groupby("Exercise", sort=False):
 
         st.markdown("<div class='set-card'>", unsafe_allow_html=True)
         st.markdown(f"<div class='set-header'>Set {'' if setn is None else int(setn)}</div>", unsafe_allow_html=True)
-        st.markdown("<div class='kv'>", unsafe_allow_html=True)
-        st.markdown("<div class='k'>%1RM</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='v'>{_fmt_pct(pct)}</div>", unsafe_allow_html=True)
-        st.markdown("<div class='k'>Reps</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='v'>{_fmt_int(reps)}</div>", unsafe_allow_html=True)
-        st.markdown("<div class='k'>Doel-kg</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='v'>{_fmt_kg(tgt)}</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+
+        # Drie mini-blokken naast elkaar
+        st.markdown("<div class='pill-row'>", unsafe_allow_html=True)
+
+        st.markdown("<div class='pill'><div class='label'>%1RM</div>"
+                    f"<div class='value'>{_fmt_pct(pct)}</div></div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='pill'><div class='label'>Reps</div>"
+                    f"<div class='value'>{_fmt_int(reps)}</div></div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='pill'><div class='label'>Doel-kg</div>"
+                    f"<div class='value'>{_fmt_kg(tgt)}</div></div>", unsafe_allow_html=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)  # pill-row
 
         # Optionele warm-ups
         if show_warmups and (tgt is not None) and not (isinstance(tgt, float) and np.isnan(tgt)) and tgt > 0:
@@ -463,13 +525,14 @@ for ex, grp in plan_disp.groupby("Exercise", sort=False):
 
 with st.expander("Exporteren"):
     exp = plan_disp.copy()
-    exp = exp[["Workout","Exercise","SetNumber","%1RM","Reps","TargetKg","e1RM","SetsOverride"]]
+    exp = exp[["Workout","Exercise","SetNumber","%1RM","Reps","TargetKg","e1RM","last_nz_weight","SetsOverride"]]
     csv_bytes = exp.to_csv(index=False).encode("utf-8")
     st.download_button("Download voorstel als CSV", data=csv_bytes, file_name="coaching_voorstel.csv", mime="text/csv")
 
 if show_debug:
     st.subheader("Diagnostiek")
-    st.write("- Regels in Advies-Excel:", 0 if advice_df is None else len(advice_df))
-    st.write("- Regels in template:", len(template))
+    st.write("- Adviesregels:", 0 if advice_df is None else len(advice_df))
+    st.write("- Template regels:", len(template))
     st.write("- Matches:", matched_count)
-    st.dataframe((advice_df.head(20) if advice_df is not None else pd.DataFrame()))
+    dbg = plan.copy()
+    st.dataframe(dbg.head(50))
