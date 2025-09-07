@@ -1,12 +1,11 @@
 # app.py
-# Periodization Coach — kaart-/blokweergave per set
+# Periodization Coach — kaart-/blokweergave + robuuste Advies-Excel matching
 # Vereist: streamlit, pandas, numpy. Optioneel: openpyxl (voor .xlsx inlezen)
 
 import io
 import math
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Optional, Tuple, Iterable, Dict, List
+from datetime import datetime
+from typing import Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -33,7 +32,7 @@ with col_u2:
 with st.expander("Weergave & berekening — instellingen", expanded=True):
     col_s1, col_s2, col_s3, col_s4 = st.columns(4)
     with col_s1:
-        kg_step = st.number_input("Rondingsstap (kg)", min_value=0.25, max_value=5.0, step=0.25, value=2.5)
+        kg_step = st.number_input("Rondingsstap (kg)", min_value=0.25, max_value=5.0, step=0.25, value=1.0)
     with col_s2:
         round_mode = st.selectbox("Rondingsmodus", ["nearest", "down", "up"], index=0)
     with col_s3:
@@ -48,6 +47,13 @@ with st.expander("Weergave & berekening — instellingen", expanded=True):
         show_warmups = st.checkbox("Toon automatische warm-up sets", value=False)
     with col_s7:
         bar_weight = st.number_input("Stanggewicht (kg) — warm-up hint", min_value=0.0, max_value=30.0, value=20.0, step=0.5)
+
+    col_s8, col_s9 = st.columns(2)
+    with col_s8:
+        use_global_defaults = st.checkbox("Gebruik defaults als geen advies/fallback", value=True,
+                                          help="Zet %1RM=70 en Reps=8 als er geen match is en er geen fallback-matrix beschikbaar is.")
+    with col_s9:
+        show_debug = st.checkbox("Toon debug-diagnostiek", value=False)
 
 # ==============================
 # ---------- Helpers ----------
@@ -72,6 +78,19 @@ def _safe_float(x) -> Optional[float]:
         if x is None or (isinstance(x, float) and np.isnan(x)) or (isinstance(x, str) and x.strip() == ""):
             return None
         return float(x)
+    except Exception:
+        return None
+
+def _coerce_pct(val) -> Optional[float]:
+    """Ondersteunt 75 of '75%' of ' 75 % ' → 75.0"""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return None
+    s = str(val).strip()
+    if s == "":
+        return None
+    s = s.replace("%", "").strip()
+    try:
+        return float(s)
     except Exception:
         return None
 
@@ -104,13 +123,11 @@ def _isocalendar_tuple(ts: pd.Timestamp) -> Tuple[int, int]:
 
 def _read_strong_csv(file) -> pd.DataFrame:
     df = pd.read_csv(file)
-    # Minimale vereisten
     req = {"Date", "Exercise Name", "Weight", "Reps"}
     missing = req - set(df.columns)
     if missing:
         st.error(f"Strong CSV mist kolommen: {sorted(missing)}")
         st.stop()
-    # Parse datum
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df["Exercise"] = df["Exercise Name"].astype(str)
     df["Weight"] = pd.to_numeric(df["Weight"], errors="coerce")
@@ -118,9 +135,9 @@ def _read_strong_csv(file) -> pd.DataFrame:
     df["ISO_Year"], df["ISO_Week"] = zip(*df["Date"].map(_isocalendar_tuple))
     return df
 
-def _read_advice_xlsx(file) -> pd.DataFrame:
+def _read_advice_xlsx(upload) -> pd.DataFrame:
     try:
-        df = pd.read_excel(io.BytesIO(file.read()), sheet_name="advice", engine="openpyxl")
+        df = pd.read_excel(io.BytesIO(upload.read()), sheet_name="advice", engine="openpyxl")
     except ModuleNotFoundError:
         st.error("Openen van .xlsx vereist **openpyxl**. Installeer met `pip install openpyxl`.")
         st.stop()
@@ -137,6 +154,7 @@ def _read_advice_xlsx(file) -> pd.DataFrame:
     df["SetNumber_int"] = df["SetNumber"].map(_safe_int)
     df["ISO_Year_int"] = df["ISO_Year"].map(_safe_int)
     df["ISO_Week_int"] = df["ISO_Week"].map(_safe_int)
+    # Spec/recency
     df["spec"] = (
         df["ISO_Year_int"].notna().astype(int)
         + df["ISO_Week_int"].notna().astype(int)
@@ -145,6 +163,10 @@ def _read_advice_xlsx(file) -> pd.DataFrame:
         + df["SetNumber_int"].notna().astype(int)
     )
     df["recency"] = list(zip(df["ISO_Year_int"].fillna(-1e9), df["ISO_Week_int"].fillna(-1e9)))
+    # Coerce %1RM/Reps
+    df["%1RM"] = df["%1RM"].map(_coerce_pct)
+    df["Reps"] = df["Reps"].map(_safe_int)
+    df["SetsOverride"] = df["SetsOverride"].map(_safe_int)
     return df
 
 def _best_match(adf: pd.DataFrame,
@@ -153,6 +175,7 @@ def _best_match(adf: pd.DataFrame,
                 workout: str,
                 exercise: str,
                 setno: Optional[int]) -> Optional[pd.Series]:
+    """Zoek beste match met aflopende strengheid; accepteer exercise-only ook als Workout in Excel wél gevuld is."""
     if adf is None or adf.empty:
         return None
     w = _norm(workout)
@@ -166,27 +189,21 @@ def _best_match(adf: pd.DataFrame,
             sub = sub.sort_values(by=["spec", "recency"], ascending=[False, False], kind="mergesort")
             picks.append(sub.iloc[0])
 
-    # 1) Y+W+workout+exercise+set
+    # Strikte lagen (zoals eerder)
     pick((adf["ISO_Year_int"] == iso_year) & (adf["ISO_Week_int"] == iso_week) &
          (adf["Workout_norm"] == w) & (adf["Exercise_norm"] == e) & (adf["SetNumber_int"] == s))
-    # 2) Y+W+workout+exercise
     pick((adf["ISO_Year_int"] == iso_year) & (adf["ISO_Week_int"] == iso_week) &
          (adf["Workout_norm"] == w) & (adf["Exercise_norm"] == e) & adf["SetNumber_int"].isna())
-    # 3) Y+W+exercise
     pick((adf["ISO_Year_int"] == iso_year) & (adf["ISO_Week_int"] == iso_week) &
-         (adf["Exercise_norm"] == e) & (adf["Exercise_norm"] == e))
-    # 4) workout+exercise+set (jaar/week leeg)
+         (adf["Exercise_norm"] == e))
     pick(adf["ISO_Year_int"].isna() & adf["ISO_Week_int"].isna() &
          (adf["Workout_norm"] == w) & (adf["Exercise_norm"] == e) & (adf["SetNumber_int"] == s))
-    # 5) workout+exercise
     pick(adf["ISO_Year_int"].isna() & adf["ISO_Week_int"].isna() &
          (adf["Workout_norm"] == w) & (adf["Exercise_norm"] == e) & adf["SetNumber_int"].isna())
-    # 6) exercise+set
-    pick(adf["ISO_Year_int"].isna() & adf["ISO_Week_int"].isna() &
-         (adf["Workout_norm"] == "") & (adf["Exercise_norm"] == e) & (adf["SetNumber_int"] == s))
-    # 7) exercise
-    pick(adf["ISO_Year_int"].isna() & adf["ISO_Week_int"].isna() &
-         (adf["Workout_norm"] == "") & (adf["Exercise_norm"] == e) & adf["SetNumber_int"].isna())
+
+    # Losser: negeer Workout-waarde voor exercise(+set)
+    pick((adf["Exercise_norm"] == e) & (adf["SetNumber_int"] == s))
+    pick((adf["Exercise_norm"] == e) & adf["SetNumber_int"].isna())
 
     return picks[0] if picks else None
 
@@ -196,35 +213,12 @@ def _compute_e1rm(df: pd.DataFrame, lookback_weeks: int) -> pd.DataFrame:
     last_date = df["Date"].max()
     cutoff = last_date - pd.Timedelta(weeks=int(lookback_weeks))
     sub = df[df["Date"] >= cutoff].copy()
-    # filter incomplete rijen
     sub = sub.dropna(subset=["Weight", "Reps"])
+    # filter bodyweight (Weight==0) uit voor e1RM
+    sub = sub[(sub["Weight"] > 0) & (sub["Reps"] > 0)]
     sub["est_1rm"] = _epley_1rm(sub["Weight"].astype(float), sub["Reps"].astype(int))
     agg = sub.groupby("Exercise", as_index=False)["est_1rm"].max().rename(columns={"est_1rm": "e1RM"})
     return agg
-
-def _apply_fallback(row: pd.Series, fallback_tbl: pd.DataFrame) -> Tuple[Optional[float], Optional[int], Optional[int]]:
-    if fallback_tbl is None or fallback_tbl.empty:
-        return (None, None, None)
-    mg = _norm(row.get("MuscleGroup"))
-    ls = _norm(row.get("LoadStatus"))
-    hit = fallback_tbl[(fallback_tbl["MuscleGroup_norm"] == mg) & (fallback_tbl["LoadStatus_norm"] == ls)]
-    if hit.empty:
-        return (None, None, None)
-    r = hit.iloc[0]
-    return (_safe_float(r.get("%1RM")), _safe_int(r.get("Reps")), _safe_int(r.get("Sets")))
-
-def _prep_fallback_matrix(raw: Optional[pd.DataFrame]) -> pd.DataFrame:
-    # Verwacht kolommen: MuscleGroup, LoadStatus, %1RM, Reps, Sets
-    if raw is None:
-        return pd.DataFrame(columns=["MuscleGroup","LoadStatus","%1RM","Reps","Sets","MuscleGroup_norm","LoadStatus_norm"])
-    df = raw.copy()
-    for c in ["MuscleGroup", "LoadStatus"]:
-        if c not in df.columns: df[c] = ""
-    df["MuscleGroup_norm"] = df["MuscleGroup"].map(_norm)
-    df["LoadStatus_norm"] = df["LoadStatus"].map(_norm)
-    for c in ["%1RM", "Reps", "Sets"]:
-        if c not in df.columns: df[c] = np.nan
-    return df
 
 def _calc_target_weight(e1rm: Optional[float], pct: Optional[float], step: float, mode: str) -> Optional[float]:
     if e1rm is None or pct is None:
@@ -247,7 +241,7 @@ advice_df = None
 if advice_xlsx is not None:
     advice_df = _read_advice_xlsx(advice_xlsx)
 
-# Basistemplate (voorbeeld): laatste uitvoering per oefening ⇒ 3 sets default
+# Basistemplate: laatste uitvoering per oefening ⇒ default 3 sets
 last_by_ex = df_strong.sort_values("Date").groupby("Exercise", as_index=False).tail(1)
 template_rows = []
 for r in last_by_ex.itertuples(index=False):
@@ -256,47 +250,41 @@ for r in last_by_ex.itertuples(index=False):
             "Workout": default_workout_name,
             "Exercise": getattr(r, "Exercise"),
             "SetNumber": s,
-            "MuscleGroup": "",          # optioneel te vullen
-            "LoadStatus": "ok",         # "low"/"ok"/"high"
-            "Sets": 3                   # default sets
+            "Sets": 3
         })
 template = pd.DataFrame(template_rows)
-
-# Merge e1RM
 template = template.merge(e1rm_tbl, on="Exercise", how="left")
 
-# Advies-matching / fallback
-fallback_matrix = _prep_fallback_matrix(None)  # <- vul met eigen matrix indien gewenst
-
-out_rows = []
+# Advies-matching
 today = datetime.now()
 isoY, isoW = today.isocalendar().year, today.isocalendar().week
 
-for r in template.itertuples(index=False):
-    ex = getattr(r, "Exercise")
-    setno = getattr(r, "SetNumber")
-    workout = getattr(r, "Workout")
+out_rows = []
+matched_count = 0
 
-    match = None
-    if advice_df is not None:
-        match = _best_match(advice_df, isoY, isoW, workout, ex, setno)
+for _, row in template.iterrows():
+    ex = str(row["Exercise"])
+    setno = int(row["SetNumber"])
+    workout = str(row["Workout"])
 
-    pct = _safe_float(match["%1RM"]) if match is not None else None
+    match = _best_match(advice_df, isoY, isoW, workout, ex, setno) if advice_df is not None else None
+    if match is not None:
+        matched_count += 1
+
+    pct = _coerce_pct(match["%1RM"]) if match is not None else None
     reps = _safe_int(match["Reps"]) if match is not None else None
     sets_override = _safe_int(match["SetsOverride"]) if match is not None else None
-
-    # Fallback indien geen match
-    if pct is None or reps is None:
-        fb_pct, fb_reps, fb_sets = _apply_fallback(pd.Series(r._asdict()), fallback_matrix)
-        pct = fb_pct if pct is None else pct
-        reps = fb_reps if reps is None else reps
 
     # Veiligheidsmarge op %1RM
     if pct is not None and safety_delta != 0.0:
         pct = max(0.0, pct + float(safety_delta))
 
-    # Doel-kg
-    e1 = _safe_float(getattr(r, "e1RM"))
+    # Defaults als alles faalt (optioneel)
+    if (pct is None or reps is None) and use_global_defaults:
+        pct = 70.0 if pct is None else pct
+        reps = 8 if reps is None else reps
+
+    e1 = _safe_float(row.get("e1RM"))
     tgt_kg = _calc_target_weight(e1, pct, kg_step, round_mode) if (e1 is not None and pct is not None) else None
 
     out_rows.append({
@@ -307,12 +295,13 @@ for r in template.itertuples(index=False):
         "Reps": reps,
         "TargetKg": tgt_kg,
         "e1RM": e1,
-        "SetsOverride": sets_override
+        "SetsOverride": sets_override,
+        "_Matched": match is not None
     })
 
 plan = pd.DataFrame(out_rows)
 
-# Indien SetsOverride aanwezig is, toon precies zoveel set-blokken als override
+# SetsOverride ⇒ aantal set-kaarten
 def _apply_sets_override_to_display(df: pd.DataFrame) -> pd.DataFrame:
     out = []
     for ex, grp in df.groupby("Exercise", sort=False):
@@ -322,7 +311,6 @@ def _apply_sets_override_to_display(df: pd.DataFrame) -> pd.DataFrame:
             n_sets = int(override_vals.iloc[0])
         else:
             n_sets = int(max_set)
-        # Neem de eerste n_sets sets; indien minder rijen dan n_sets, vul aan door laatste set te kopiëren
         g = grp.sort_values("SetNumber").copy()
         if len(g) >= n_sets:
             g = g.head(n_sets)
@@ -407,15 +395,14 @@ CUSTOM_CSS = """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 # ==============================
-# ---------- Render ----------
+# ---------- Header ----------
 # ==============================
 
 if plan_disp.empty:
     st.warning("Geen adviesregels beschikbaar.")
     st.stop()
 
-# Bovenaan: context
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 with c1:
     st.metric("Unieke oefeningen", plan_disp["Exercise"].nunique())
 with c2:
@@ -424,8 +411,13 @@ with c3:
     st.metric("Lookback (weken)", lookback_weeks)
 with c4:
     st.metric("Ronding (kg)", kg_step)
+with c5:
+    st.metric("Advies-matches", int((plan["_Matched"] == True).sum()))
 
-# Render per oefening
+# ==============================
+# ---------- Render ----------
+# ==============================
+
 for ex, grp in plan_disp.groupby("Exercise", sort=False):
     grp = grp.sort_values("SetNumber")
     e1 = grp["e1RM"].dropna().max()
@@ -434,7 +426,6 @@ for ex, grp in plan_disp.groupby("Exercise", sort=False):
     st.markdown(f"<div class='section-title'>{header}<span class='badge'>{sub}</span></div>", unsafe_allow_html=True)
     st.markdown("<div class='exercise-card'>", unsafe_allow_html=True)
 
-    # Grid van set-kaarten — LET OP: iterrows i.p.v. itertuples om '%1RM' veilig te lezen
     st.markdown("<div class='set-grid'>", unsafe_allow_html=True)
     for _, rr in grp.iterrows():
         pct = _safe_float(rr.get("%1RM"))
@@ -444,7 +435,6 @@ for ex, grp in plan_disp.groupby("Exercise", sort=False):
 
         st.markdown("<div class='set-card'>", unsafe_allow_html=True)
         st.markdown(f"<div class='set-header'>Set {'' if setn is None else int(setn)}</div>", unsafe_allow_html=True)
-
         st.markdown("<div class='kv'>", unsafe_allow_html=True)
         st.markdown("<div class='k'>%1RM</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='v'>{_fmt_pct(pct)}</div>", unsafe_allow_html=True)
@@ -452,7 +442,7 @@ for ex, grp in plan_disp.groupby("Exercise", sort=False):
         st.markdown(f"<div class='v'>{_fmt_int(reps)}</div>", unsafe_allow_html=True)
         st.markdown("<div class='k'>Doel-kg</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='v'>{_fmt_kg(tgt)}</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)  # kv
+        st.markdown("</div>", unsafe_allow_html=True)
 
         # Optionele warm-ups
         if show_warmups and (tgt is not None) and not (isinstance(tgt, float) and np.isnan(tgt)) and tgt > 0:
@@ -468,7 +458,7 @@ for ex, grp in plan_disp.groupby("Exercise", sort=False):
     st.markdown("</div>", unsafe_allow_html=True)  # exercise-card
 
 # ==============================
-# ---------- Exports ----------
+# ---------- Export & Debug ----------
 # ==============================
 
 with st.expander("Exporteren"):
@@ -477,7 +467,9 @@ with st.expander("Exporteren"):
     csv_bytes = exp.to_csv(index=False).encode("utf-8")
     st.download_button("Download voorstel als CSV", data=csv_bytes, file_name="coaching_voorstel.csv", mime="text/csv")
 
-    st.markdown(
-        "- CSV is bedoeld als audit trail. De **kaart-weergave** hierboven is leidend voor de uitvoering.\n"
-        "- Pas instellingen aan (ronding, lookback, veiligheidsmarge) om de blokken realtime te herberekenen."
-    )
+if show_debug:
+    st.subheader("Diagnostiek")
+    st.write("- Regels in Advies-Excel:", 0 if advice_df is None else len(advice_df))
+    st.write("- Regels in template:", len(template))
+    st.write("- Matches:", matched_count)
+    st.dataframe((advice_df.head(20) if advice_df is not None else pd.DataFrame()))
