@@ -1,449 +1,483 @@
 # app.py
-# Periodization Coach — All-in-One (Coach-first UI with Insights side page)
-# Python 3.10+
-# -----------------------------------------------------------------------------
-# Features
-# - Main page: 8 large buttons for workouts; on click: show full per-set coaching (all exercises).
-# - Side page ("Insights"): weekly muscle volume (LOW/OK/HIGH), 1RM library, safety rules.
-# - Upload Strong CSV (Date, Exercise Name, Weight, Reps) + optional Advice Excel (sheet "advice").
-# - Advice precedence (ISO Year/Week/Workout/Exercise/SetNumber), else fallbacks by muscle & status.
-# - DUP scaling (H/M/L) adjusts %1RM on the Coach page.
-# - Rounded target loads (DB 2.0 kg, bar 2.5 kg), dumbbell/bar inference by exercise name.
-# - A/B alternation by ISO week parity remains supported; user can override by picking any workout.
-# -----------------------------------------------------------------------------
+# Periodization Coach — kaart-/blokweergave per set
+# Vereist: streamlit, pandas, numpy. Optioneel: openpyxl (voor .xlsx inlezen)
 
 import io
-from datetime import datetime, date
-from typing import Dict, Tuple
+import math
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Optional, Tuple, Iterable, Dict, List
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
-# ----------------------- CONFIG --------------------------------------------------
+# =========================
+# ---------- UI ----------
+# =========================
 
-TARGET_MIN = 10
-TARGET_MAX = 20
-ROLLING_WEEKS = 4
+st.set_page_config(page_title="Periodization Coach — Kaartenweergave", layout="wide")
 
-DB_STEP = 2.0
-BAR_STEP = 2.5
+st.title("Next Workout — Coachingvoorstel (Kaartenweergave)")
+st.caption(
+    "Upload je Strong-export (CSV). Optioneel: Advies-Excel (tab **advice**) met `%1RM`, `Reps`, `SetsOverride`. "
+    "Resultaat toont per oefening grote blokken per set met %1RM, reps en doel-kg."
+)
 
-WORKOUTS = ["1A Push","2A Push","1B Push","2B Push","1A Pull","2A Pull","1B Pull","2B Pull"]
+col_u1, col_u2 = st.columns(2)
+with col_u1:
+    strong_file = st.file_uploader("Strong CSV", type=["csv"])
+with col_u2:
+    advice_xlsx = st.file_uploader("Advies-Excel (tab: advice)", type=["xlsx"])
 
-TEMPLATES = {
-    # --- PUSH ---
-    "1A Push": [
-        ("Incline Bench Press (Dumbbell)", 2),
-        ("Chest Fly (Cable)", 2),
-        ("Lateral Raise (Dumbbell)", 2),
-        ("Tricep Pushdown (Cable)", 2),
-        ("Skullcrusher (Dumbbell)", 2),
-        ("Cable Crunch", 2),
-    ],
-    "2A Push": [
-        ("Bench Press (Dumbbell)", 3),
-        ("Chest Fly (Dumbbell)", 2),
-        ("Lateral Raise (Dumbbell)", 2),
-        ("Tricep Pushdown (Cable - Straight Bar)", 2),
-        ("Cable Crunch", 2),
-    ],
-    "1B Push": [
-        ("Bench Press (Cable)", 3),
-        ("Overhead Press (Dumbbell)", 1),  # trimmed as discussed
-        ("Lateral Raise (Dumbbell)", 2),
-        ("Chest Fly (Dumbbell)", 2),
-        ("Tricep Pushdown (Cable)", 2),
-        ("Triceps Extension (Cable)", 2),
-        ("Hanging Knee Raise", 2),
-    ],
-    "2B Push": [
-        ("Incline Bench Press (Dumbbell)", 3),
-        ("Seated Overhead Press (Dumbbell)", 1),  # trimmed as discussed
-        ("Lateral Raise (Cable)", 2),
-        ("Triceps Extension (Cable)", 2),
-        ("Cable Crunch", 2),
-    ],
-    # --- PULL ---
-    "1A Pull": [
-        ("Lat Pulldown (Cable)", 3),            # +1 applied
-        ("Incline Row (Dumbbell)", 3),
-        ("Cable Crunch", 2),
-        ("Reverse Fly (Cable)", 2),
-        ("Incline DB Hammer Curl", 3),          # upgraded
-    ],
-    "2A Pull": [
-        ("Lat Pulldown (Cable)", 2),
-        ("Incline Row (Dumbbell)", 3),          # +1 applied
-        ("Cable Crunch", 2),
-        ("Y-Raise", 2),                         # swap for DB reverse fly
-        ("Bicep Curl (Dumbbell)", 3),           # upgraded
-    ],
-    "1B Pull": [
-        ("Lat Pulldown (Cable)", 2),
-        ("Seated Row (Cable)", 3),              # +1 applied
-        ("Face Pull (Cable)", 3),               # +1 applied
-        ("Cable Crunch", 2),
-        ("LOW CABLE BICEP CURL (Cable)", 3),    # upgraded
-    ],
-    "2B Pull": [
-        ("Lat Pulldown (Cable)", 3),            # +1 applied
-        ("Seated Row (Cable)", 2),
-        ("Hanging Knee Raise", 2),
-        ("Face Pull (Cable)", 2),
-        ("EZ BAR CURL (Cable)", 3),             # upgraded
-    ],
-}
+with st.expander("Weergave & berekening — instellingen", expanded=True):
+    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+    with col_s1:
+        kg_step = st.number_input("Rondingsstap (kg)", min_value=0.25, max_value=5.0, step=0.25, value=2.5)
+    with col_s2:
+        round_mode = st.selectbox("Rondingsmodus", ["nearest", "down", "up"], index=0)
+    with col_s3:
+        safety_delta = st.number_input("Veiligheidsmarge op %1RM (-=zwaarder, +=lichter)", value=0.0, step=1.0, format="%.1f")
+    with col_s4:
+        lookback_weeks = st.number_input("Max. lookback (weken) voor e1RM", min_value=1, max_value=52, value=8, step=1)
 
-MUSCLE_MAP = {
-    # Chest
-    "Bench Press (Dumbbell)": "Chest",
-    "Bench Press (Cable)": "Chest",
-    "Incline Bench Press (Dumbbell)": "Chest",
-    "Chest Fly (Dumbbell)": "Chest",
-    "Chest Fly (Cable)": "Chest",
-    # Shoulders
-    "Overhead Press (Dumbbell)": "Shoulders",
-    "Seated Overhead Press (Dumbbell)": "Shoulders",
-    "Arnold Press (Dumbbell)": "Shoulders",
-    "Front Raise (Cable)": "Shoulders",
-    "Lateral Raise (Dumbbell)": "Shoulders",
-    "Lateral Raise (Cable)": "Shoulders",
-    "Reverse Fly (Dumbbell)": "Shoulders",
-    "Reverse Fly (Cable)": "Shoulders",
-    "Face Pull (Cable)": "Shoulders",
-    "Y-Raise": "Shoulders",
-    # Triceps
-    "Tricep Pushdown (Cable)": "Triceps",
-    "Tricep Pushdown (Cable - Straight Bar)": "Triceps",
-    "Triceps Extension (Cable)": "Triceps",
-    "Skullcrusher (Dumbbell)": "Triceps",
-    # Back
-    "Lat Pulldown (Cable)": "Back",
-    "Incline Row (Dumbbell)": "Back",
-    "Seated Row (Cable)": "Back",
-    # Biceps
-    "Incline DB Hammer Curl": "Biceps",
-    "Bicep Curl (Dumbbell)": "Biceps",
-    "LOW CABLE BICEP CURL (Cable)": "Biceps",
-    "EZ BAR CURL (Cable)": "Biceps",
-    # Core
-    "Cable Crunch": "Core",
-    "Hanging Knee Raise": "Core",
-}
+    col_s5, col_s6, col_s7 = st.columns(3)
+    with col_s5:
+        default_workout_name = st.text_input("Dagtype/Workout", value="Push")
+    with col_s6:
+        show_warmups = st.checkbox("Toon automatische warm-up sets", value=False)
+    with col_s7:
+        bar_weight = st.number_input("Stanggewicht (kg) — warm-up hint", min_value=0.0, max_value=30.0, value=20.0, step=0.5)
 
-FALLBACK = {
-    # Defaults aim at hypertrophy with your %1RM preference
-    "Chest":     {"TopPct": 80, "TopReps": 6,  "BackPct": 70, "BackReps": 10},
-    "Back":      {"TopPct": 75, "TopReps": 8,  "BackPct": 65, "BackReps": 12},
-    "Shoulders": {"TopPct": 72, "TopReps": 8,  "BackPct": 60, "BackReps": 15},
-    "Triceps":   {"TopPct": 70, "TopReps":10,  "BackPct": 62, "BackReps": 14},
-    "Biceps":    {"TopPct": 70, "TopReps":10,  "BackPct": 62, "BackReps": 14},
-    "Core":      {"TopPct": 80, "TopReps":10,  "BackPct": 65, "BackReps": 15},
-    "Other":     {"TopPct": 70, "TopReps":10,  "BackPct": 60, "BackReps": 12},
-}
+# ==============================
+# ---------- Helpers ----------
+# ==============================
 
-DUP_SCALE = {"H": 1.00, "M": 0.96, "L": 0.92}
+def _norm(s) -> str:
+    if pd.isna(s):
+        return ""
+    s = str(s).strip().lower()
+    return " ".join(s.split())
 
-# ----------------------- HELPERS -------------------------------------------------
-
-def to_date(s):
-    if isinstance(s, (date, datetime)): return pd.to_datetime(s).date()
-    return pd.to_datetime(s, errors="coerce").date()
-
-def is_dumbbell(name: str) -> bool:
-    return ("Dumbbell" in name) or ("DB" in name)
-
-def round_load(x: float, is_db: bool) -> float:
-    step = DB_STEP if is_db else BAR_STEP
-    return round(round(x / step) * step, 2)
-
-# 1RM estimators
-def epley_1rm(w, r):   return w * (1 + r / 30)
-def brzycki_1rm(w, r): return (w * (36 / (37 - r))) if r < 37 else np.nan
-def blended_1rm(w, r):
-    if r <= 1: return w
-    return np.nanmean([epley_1rm(w, r), brzycki_1rm(w, r)])
-
-def best_1rm(df: pd.DataFrame, weeks=8) -> pd.Series:
-    if df.empty: return pd.Series(dtype=float)
-    df = df.copy()
-    df["Date"] = pd.to_datetime(df["Date"])
-    cutoff = df["Date"].max() - pd.Timedelta(weeks=weeks)
-    df = df[df["Date"] >= cutoff]
-    df["est_1rm"] = df.apply(lambda r: blended_1rm(r["Weight"], r["Reps"]), axis=1)
-    return df.groupby("Exercise Name")["est_1rm"].max()
-
-def status_tag(n_sets: float) -> str:
-    if n_sets < TARGET_MIN: return "LOW"
-    if n_sets > TARGET_MAX: return "HIGH"
-    return "OK"
-
-def coach_for_set(muscle: str, set_idx: int, muscle_status: Dict[str,str]):
-    base = FALLBACK.get(muscle, FALLBACK["Other"]).copy()
-    status = muscle_status.get(muscle, "OK")
-    if status == "LOW":
-        base["TopPct"] += 2; base["BackPct"] += 2; base["BackReps"] += 2
-    elif status == "HIGH":
-        base["TopPct"] -= 3; base["BackPct"] -= 3; base["BackReps"] -= 2
-    if set_idx == 1: return base["TopPct"], base["TopReps"]
-    return base["BackPct"], base["BackReps"]
-
-# ----------------------- APP LAYOUT ---------------------------------------------
-
-st.set_page_config(page_title="Periodization Coach — All-in-One", layout="wide")
-
-# Sidebar (uploads + selections)
-st.sidebar.header("Uploads")
-strong_file = st.sidebar.file_uploader("Strong CSV", type=["csv"])
-advice_file = st.sidebar.file_uploader("Advice Excel (sheet: advice)", type=["xlsx"])
-
-st.sidebar.header("Parameters")
-today = pd.Timestamp.today()
-default_year = int(today.isocalendar().year)
-default_week = int(today.isocalendar().week)
-
-year = st.sidebar.number_input("ISO Year", min_value=2000, max_value=2100, value=default_year, step=1)
-week = st.sidebar.number_input("ISO Week", min_value=1, max_value=53, value=default_week, step=1)
-dup_choice = st.sidebar.selectbox("DUP (H/M/L)", ["H","M","L"], index=0)
-
-st.sidebar.markdown("---")
-st.sidebar.caption("Ma: Push • Di: Pull • Do: Push • Vr/Zat: Pull")
-
-# Simple page switcher (Coach vs Insights)
-page = st.sidebar.radio("Pagina", ["Coach", "Insights"], index=0)
-
-# ----------------------- DATA LOADING -------------------------------------------
-
-df = pd.DataFrame()
-advice_df = None
-if strong_file is not None:
-    df = pd.read_csv(strong_file)
-    # Validate
-    required = {"Date","Exercise Name","Weight","Reps"}
-    missing = required - set(df.columns)
-    if missing:
-        st.error(f"CSV mist verplichte kolommen: {missing}")
-        st.stop()
-    # Normalize
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df["Exercise Name"] = df["Exercise Name"].astype(str)
-    df["Reps"] = pd.to_numeric(df["Reps"], errors="coerce")
-    df["Weight"] = pd.to_numeric(df["Weight"], errors="coerce")
-    df["ISO_Year"] = df["Date"].dt.isocalendar().year.astype(int)
-    df["ISO_Week"] = df["Date"].dt.isocalendar().week.astype(int)
-    df["Muscle"] = df["Exercise Name"].map(MUSCLE_MAP).fillna("Other")
-
-    # Volume per week per spiergroep
-    vol = (
-        df.assign(Set=1)
-          .groupby(["ISO_Year","ISO_Week","Muscle"], as_index=False)["Set"].sum()
-    )
-else:
-    vol = pd.DataFrame(columns=["ISO_Year","ISO_Week","Muscle","Set"])
-
-if advice_file is not None:
+def _safe_int(x) -> Optional[int]:
     try:
-        advice_df = pd.read_excel(advice_file, sheet_name="advice")
-        # Normalize numeric columns
-        for c in ["ISO_Year","ISO_Week","SetNumber","%1RM","Reps","SetsOverride"]:
-            if c in advice_df.columns:
-                advice_df[c] = pd.to_numeric(advice_df[c], errors="coerce")
-        if "Workout" in advice_df.columns:
-            advice_df["Workout"] = advice_df["Workout"].astype(str)
-        if "Exercise" in advice_df.columns:
-            advice_df["Exercise"] = advice_df["Exercise"].astype(str)
-    except Exception as e:
-        st.error(f"Kon sheet 'advice' niet lezen: {e}")
+        if x is None or (isinstance(x, float) and np.isnan(x)) or (isinstance(x, str) and x.strip() == ""):
+            return None
+        return int(float(x))
+    except Exception:
+        return None
 
-# Build weekly status table for selected week
-week_summary = pd.DataFrame({"Muscle": sorted(set(MUSCLE_MAP.values())), "Set": 0})
-if not vol.empty:
-    sel = vol[(vol["ISO_Year"] == year) & (vol["ISO_Week"] == week)]
-    if not sel.empty:
-        week_summary = sel.groupby("Muscle", as_index=False)["Set"].sum()
-        # ensure all muscles present
-        all_m = sorted(set(MUSCLE_MAP.values()))
-        week_summary = (week_summary
-                        .set_index("Muscle")
-                        .reindex(all_m, fill_value=0)
-                        .reset_index())
-week_summary["Status"] = week_summary["Set"].apply(status_tag)
-muscle_status_dict = {r["Muscle"]: r["Status"] for _, r in week_summary.iterrows()}
+def _safe_float(x) -> Optional[float]:
+    try:
+        if x is None or (isinstance(x, float) and np.isnan(x)) or (isinstance(x, str) and x.strip() == ""):
+            return None
+        return float(x)
+    except Exception:
+        return None
 
-# 1RM library (last 8 weeks)
-ones = best_1rm(df) if not df.empty else pd.Series(dtype=float)
+def _round_weight(kg: float, step: float, mode: str) -> float:
+    if step <= 0:
+        return round(kg, 1)
+    q = kg / step
+    if mode == "up":
+        return round(math.ceil(q) * step, 3)
+    if mode == "down":
+        return round(math.floor(q) * step, 3)
+    return round(round(q) * step, 3)  # nearest
 
-# ----------------------- COACH PAGE ---------------------------------------------
+def _epley_1rm(weight: float, reps: int) -> float:
+    # Epley: 1RM = w*(1 + r/30)
+    return weight * (1.0 + reps / 30.0)
 
-def lookup_advice(ex: str, workout: str, set_idx: int) -> Tuple[float, int, int | None]:
-    """
-    Returns (%1RM, reps, sets_override) if present in advice_df for current year/week, else (np.nan, None, None).
-    Set-specific advice preferred; if SetsOverride present (any row for this ex/workout), return it too.
-    """
-    if advice_df is None: return np.nan, None, None
-    q = advice_df[
-        ((advice_df["ISO_Year"].isna()) | (advice_df["ISO_Year"] == year)) &
-        ((advice_df["ISO_Week"].isna()) | (advice_df["ISO_Week"] == week)) &
-        ((advice_df["Workout"].isna())  | (advice_df["Workout"] == workout)) &
-        (advice_df["Exercise"] == ex)
-    ].copy()
-    if q.empty: return np.nan, None, None
+def _isocalendar_tuple(ts: pd.Timestamp) -> Tuple[int, int]:
+    iso = ts.isocalendar()
+    return int(iso.year), int(iso.week)
 
-    set_match = q[q["SetNumber"] == set_idx]
-    row = set_match.iloc[0] if not set_match.empty else q.iloc[0]
-
-    pct = float(row["%1RM"]) if not np.isnan(row.get("%1RM", np.nan)) else np.nan
-    reps = int(row["Reps"])   if not np.isnan(row.get("Reps", np.nan))   else None
-
-    sets_override = None
-    qo = q[q["SetsOverride"].notna()]
-    if not qo.empty:
-        sets_override = int(qo.iloc[0]["SetsOverride"])
-    return pct, reps, sets_override
-
-def build_plan_for_workout(workout: str, dup: str) -> pd.DataFrame:
-    rows = []
-    template = TEMPLATES.get(workout, [])
-    scale = DUP_SCALE.get(dup, 1.0)
-
-    # first pass: read sets_override from advice if provided
-    ex_to_sets = {}
-    for ex, base_sets in template:
-        _, _, sets_override = lookup_advice(ex, workout, set_idx=1)
-        ex_to_sets[ex] = sets_override if sets_override is not None else base_sets
-
-    for ex, _ in template:
-        n_sets = ex_to_sets[ex]
-        muscle = MUSCLE_MAP.get(ex, "Other")
-        est1rm = ones.get(ex, np.nan)
-
-        for s in range(1, n_sets + 1):
-            adv_pct, adv_reps, _ = lookup_advice(ex, workout, s)
-            if not np.isnan(adv_pct) and adv_reps is not None:
-                pct, reps = adv_pct, adv_reps
-            else:
-                pct, reps = coach_for_set(muscle, s, muscle_status_dict)
-
-            pct = pct * scale
-            load = np.nan
-            if not np.isnan(est1rm):
-                load = round_load(est1rm * (pct / 100.0), is_dumbbell(ex))
-
-            rows.append({
-                "Exercise": ex,
-                "Set": s,
-                "%1RM": round(pct, 1),
-                "Reps": reps,
-                "Target Load (kg)": None if np.isnan(load) else load,
-                "Est. 1RM (kg)": None if np.isnan(est1rm) else round(float(est1rm), 1),
-                "Muscle": muscle,
-                "RPE/RIR hint": "Top-set ≈RPE8 (RIR~2)" if s == 1 else "Back-off ≈RPE7–8 (RIR~2–3)",
-            })
-    dfw = pd.DataFrame(rows)
-    dfw = dfw.sort_values(["Exercise","Set"]).reset_index(drop=True)
-    return dfw
-
-def big_button(label: str, key: str):
-    c = st.container()
-    with c:
-        st.markdown(
-            f"""
-            <style>
-            .btn-{key} button {{
-                border: 2px solid #1f77b4;
-                border-radius: 10px;
-                padding: 18px 12px;
-                font-size: 18px;
-                width: 100%;
-                height: 78px;
-                background: white;
-            }}
-            .btn-{key} button:hover {{
-                background: #eaf3ff;
-            }}
-            </style>
-            """, unsafe_allow_html=True
-        )
-        return st.container().button(label, key=key, use_container_width=True)
-
-if page == "Coach":
-    st.title("Workout Coach")
-
-    if strong_file is None:
-        st.info("Upload Strong CSV en (optioneel) Advice Excel in de sidebar.")
+def _read_strong_csv(file) -> pd.DataFrame:
+    df = pd.read_csv(file)
+    # Minimale vereisten
+    req = {"Date", "Exercise Name", "Weight", "Reps"}
+    missing = req - set(df.columns)
+    if missing:
+        st.error(f"Strong CSV mist kolommen: {sorted(missing)}")
         st.stop()
+    # Parse datum
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Exercise"] = df["Exercise Name"].astype(str)
+    df["Weight"] = pd.to_numeric(df["Weight"], errors="coerce")
+    df["Reps"] = pd.to_numeric(df["Reps"], errors="coerce")
+    df["ISO_Year"], df["ISO_Week"] = zip(*df["Date"].map(_isocalendar_tuple))
+    return df
 
-    st.markdown("**Kies je workout**")
-    # Grid met 8 knoppen (4 x 2)
-    sel = None
-    rows = [
-        ["1A Push","2A Push","1B Push","2B Push"],
-        ["1A Pull","2A Pull","1B Pull","2B Pull"]
-    ]
-    for r in rows:
-        cols = st.columns(len(r), gap="large")
-        for i, w in enumerate(r):
-            with cols[i]:
-                if st.button(w, key=f"btn_{w}", use_container_width=True):
-                    sel = w
+def _read_advice_xlsx(file) -> pd.DataFrame:
+    try:
+        df = pd.read_excel(io.BytesIO(file.read()), sheet_name="advice", engine="openpyxl")
+    except ModuleNotFoundError:
+        st.error("Openen van .xlsx vereist **openpyxl**. Installeer met `pip install openpyxl`.")
+        st.stop()
+    except ValueError:
+        st.error("Sheet **'advice'** niet gevonden. Hernoem tabblad naar exact `advice`.")
+        st.stop()
+    # Zorg voor aanwezigheid kolommen
+    for c in ["ISO_Year", "ISO_Week", "Workout", "Exercise", "SetNumber", "%1RM", "Reps", "SetsOverride"]:
+        if c not in df.columns:
+            df[c] = np.nan
+    # Normalisatie
+    df["Workout_norm"] = df["Workout"].map(_norm)
+    df["Exercise_norm"] = df["Exercise"].map(_norm)
+    df["SetNumber_int"] = df["SetNumber"].map(_safe_int)
+    df["ISO_Year_int"] = df["ISO_Year"].map(_safe_int)
+    df["ISO_Week_int"] = df["ISO_Week"].map(_safe_int)
+    df["spec"] = (
+        df["ISO_Year_int"].notna().astype(int)
+        + df["ISO_Week_int"].notna().astype(int)
+        + (df["Workout_norm"] != "").astype(int)
+        + (df["Exercise_norm"] != "").astype(int)
+        + df["SetNumber_int"].notna().astype(int)
+    )
+    df["recency"] = list(zip(df["ISO_Year_int"].fillna(-1e9), df["ISO_Week_int"].fillna(-1e9)))
+    return df
 
-    # Als geen knop is gedrukt: voorstel op basis van weekpariteit (A/B)
-    if sel is None:
-        is_even = (week % 2 == 0)
-        sel = "1B Push" if is_even else "1A Push"
+def _best_match(adf: pd.DataFrame,
+                iso_year: Optional[int],
+                iso_week: Optional[int],
+                workout: str,
+                exercise: str,
+                setno: Optional[int]) -> Optional[pd.Series]:
+    if adf is None or adf.empty:
+        return None
+    w = _norm(workout)
+    e = _norm(exercise)
+    s = setno
+    picks: List[pd.Series] = []
 
-    st.subheader(f"🧭 Sessie: {sel}  •  Week {week}  •  DUP: {dup_choice}")
-    st.caption("Advies uit Excel prevaleert; bij geen match vallen we terug op spiergroep-fallbacks en weekstatus (LOW/OK/HIGH).")
+    def pick(mask):
+        sub = adf[mask]
+        if not sub.empty:
+            sub = sub.sort_values(by=["spec", "recency"], ascending=[False, False], kind="mergesort")
+            picks.append(sub.iloc[0])
 
-    plan = build_plan_for_workout(sel, dup_choice)
+    # 1) Y+W+workout+exercise+set
+    pick((adf["ISO_Year_int"] == iso_year) & (adf["ISO_Week_int"] == iso_week) &
+         (adf["Workout_norm"] == w) & (adf["Exercise_norm"] == e) & (adf["SetNumber_int"] == s))
+    # 2) Y+W+workout+exercise
+    pick((adf["ISO_Year_int"] == iso_year) & (adf["ISO_Week_int"] == iso_week) &
+         (adf["Workout_norm"] == w) & (adf["Exercise_norm"] == e) & adf["SetNumber_int"].isna())
+    # 3) Y+W+exercise
+    pick((adf["ISO_Year_int"] == iso_year) & (adf["ISO_Week_int"] == iso_week) &
+         (adf["Exercise_norm"] == e) & (adf["Exercise_norm"] == e))
+    # 4) workout+exercise+set (jaar/week leeg)
+    pick(adf["ISO_Year_int"].isna() & adf["ISO_Week_int"].isna() &
+         (adf["Workout_norm"] == w) & (adf["Exercise_norm"] == e) & (adf["SetNumber_int"] == s))
+    # 5) workout+exercise
+    pick(adf["ISO_Year_int"].isna() & adf["ISO_Week_int"].isna() &
+         (adf["Workout_norm"] == w) & (adf["Exercise_norm"] == e) & adf["SetNumber_int"].isna())
+    # 6) exercise+set
+    pick(adf["ISO_Year_int"].isna() & adf["ISO_Week_int"].isna() &
+         (adf["Workout_norm"] == "") & (adf["Exercise_norm"] == e) & (adf["SetNumber_int"] == s))
+    # 7) exercise
+    pick(adf["ISO_Year_int"].isna() & adf["ISO_Week_int"].isna() &
+         (adf["Workout_norm"] == "") & (adf["Exercise_norm"] == e) & adf["SetNumber_int"].isna())
 
-    # Weergave: alle oefeningen tegelijk, per oefening in een 'card'
-    for ex in plan["Exercise"].unique():
-        sub = plan[plan["Exercise"] == ex].copy()
-        m = sub["Muscle"].iloc[0]
-        st.markdown(f"#### {ex}  —  *{m}*")
-        # Compacte tabel: Set | %1RM | Reps | Target Load | Est.1RM | Hint
-        show = sub[["Set","%1RM","Reps","Target Load (kg)","Est. 1RM (kg)","RPE/RIR hint"]]
-        st.dataframe(show, hide_index=True, use_container_width=True)
+    return picks[0] if picks else None
 
-    # Export voor gym-quickview
-    out = plan[["Exercise","Set","%1RM","Reps","Target Load (kg)"]].copy()
-    buf = io.StringIO(); out.to_csv(buf, index=False)
-    st.download_button("Export sessie (CSV)", data=buf.getvalue(),
-                       file_name=f"{sel.replace(' ','_').lower()}_wk{week}_plan.csv", mime="text/csv")
+def _compute_e1rm(df: pd.DataFrame, lookback_weeks: int) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["Exercise", "e1RM"])
+    last_date = df["Date"].max()
+    cutoff = last_date - pd.Timedelta(weeks=int(lookback_weeks))
+    sub = df[df["Date"] >= cutoff].copy()
 
-# ----------------------- INSIGHTS PAGE ------------------------------------------
+    sub["est_1rm"] = _epley_1rm(sub["Weight"].astype(float), sub["Reps"].astype(int))
+    agg = sub.groupby("Exercise", as_index=False)["est_1rm"].max().rename(columns={"est_1rm": "e1RM"})
+    return agg
 
-if page == "Insights":
-    st.title("Insights")
-    st.markdown("Overzicht van **weekvolume per spiergroep**, **LOW/OK/HIGH**, **1RM-bibliotheek**, en **veiligheidsregels**.")
+def _apply_fallback(row: pd.Series, fallback_tbl: pd.DataFrame) -> Tuple[Optional[float], Optional[int], Optional[int]]:
+    if fallback_tbl is None or fallback_tbl.empty:
+        return (None, None, None)
+    mg = _norm(row.get("MuscleGroup"))
+    ls = _norm(row.get("LoadStatus"))
+    hit = fallback_tbl[(fallback_tbl["MuscleGroup_norm"] == mg) & (fallback_tbl["LoadStatus_norm"] == ls)]
+    if hit.empty:
+        return (None, None, None)
+    r = hit.iloc[0]
+    return (_safe_float(r.get("%1RM")), _safe_int(r.get("Reps")), _safe_int(r.get("Sets")))
 
-    st.subheader(f"Weekvolume per spiergroep — week {week}, {year}")
-    if week_summary.empty:
-        st.info("Geen sets gevonden voor de geselecteerde week in de Strong CSV.")
-    st.dataframe(week_summary.sort_values("Muscle").reset_index(drop=True), use_container_width=True)
+def _prep_fallback_matrix(raw: Optional[pd.DataFrame]) -> pd.DataFrame:
+    # Verwacht kolommen: MuscleGroup, LoadStatus, %1RM, Reps, Sets
+    if raw is None:
+        return pd.DataFrame(columns=["MuscleGroup","LoadStatus","%1RM","Reps","Sets","MuscleGroup_norm","LoadStatus_norm"])
+    df = raw.copy()
+    for c in ["MuscleGroup", "LoadStatus"]:
+        if c not in df.columns: df[c] = ""
+    df["MuscleGroup_norm"] = df["MuscleGroup"].map(_norm)
+    df["LoadStatus_norm"] = df["LoadStatus"].map(_norm)
+    for c in ["%1RM", "Reps", "Sets"]:
+        if c not in df.columns: df[c] = np.nan
+    return df
 
-    if not week_summary.empty:
-        fig = px.bar(week_summary, x="Muscle", y="Set", color="Status",
-                     color_discrete_map={"LOW":"#F39C12","OK":"#27AE60","HIGH":"#E74C3C"},
-                     title=None)
-        st.plotly_chart(fig, use_container_width=True)
+def _calc_target_weight(e1rm: Optional[float], pct: Optional[float], step: float, mode: str) -> Optional[float]:
+    if e1rm is None or pct is None:
+        return None
+    raw = e1rm * (pct / 100.0)
+    return _round_weight(raw, step, mode)
 
-    st.subheader("Geschatte 1RM per oefening (beste uit laatste 8 weken)")
-    if ones.empty:
-        st.info("Nog geen 1RM-schattingen beschikbaar (upload Strong CSV).")
-    else:
-        disp = ones.sort_values(ascending=False).reset_index()
-        disp.columns = ["Exercise","Est_1RM (kg)"]
-        st.dataframe(disp, use_container_width=True)
+# ==============================
+# ---------- Pipeline ----------
+# ==============================
 
-    st.subheader("Veiligheidsregels")
+if strong_file is None:
+    st.info("Upload eerst je **Strong CSV** om een voorstel te genereren.")
+    st.stop()
+
+df_strong = _read_strong_csv(strong_file)
+e1rm_tbl = _compute_e1rm(df_strong, lookback_weeks)
+
+advice_df = None
+if advice_xlsx is not None:
+    advice_df = _read_advice_xlsx(advice_xlsx)
+
+# Voorbeeld: je bestaande template voor de "volgende sessie".
+# In veel implementaties wordt dit al elders afgeleid. Hier construeren we een minimale template
+# uit de meest recente training per oefening: 3 sets default, reps = laatst uitgevoerde reps.
+last_by_ex = df_strong.sort_values("Date").groupby("Exercise", as_index=False).tail(1)
+template_rows = []
+for r in last_by_ex.itertuples(index=False):
+    for s in range(1, 4):  # default 3 sets
+        template_rows.append({
+            "Workout": default_workout_name,
+            "Exercise": getattr(r, "Exercise"),
+            "SetNumber": s,
+            # optioneel gevuld in jouw data:
+            "MuscleGroup": "",          # kan door jou worden gevuld
+            "LoadStatus": "ok",         # "low"/"ok"/"high" — placeholder
+            "Sets": 3                   # default sets per oefening (kan overridden worden)
+        })
+template = pd.DataFrame(template_rows)
+
+# Merge e1RM
+template = template.merge(e1rm_tbl, on="Exercise", how="left")
+
+# Advies-matching / fallback
+fallback_matrix = _prep_fallback_matrix(None)  # <- vul met eigen matrix indien gewenst
+
+out_rows = []
+today = datetime.now()
+isoY, isoW = today.isocalendar().year, today.isocalendar().week
+
+for r in template.itertuples(index=False):
+    ex = getattr(r, "Exercise")
+    setno = getattr(r, "SetNumber")
+    workout = getattr(r, "Workout")
+
+    match = None
+    if advice_df is not None:
+        match = _best_match(advice_df, isoY, isoW, workout, ex, setno)
+
+    pct = _safe_float(match["%1RM"]) if match is not None else None
+    reps = _safe_int(match["Reps"]) if match is not None else None
+    sets_override = _safe_int(match["SetsOverride"]) if match is not None else None
+
+    # Fallback indien geen match
+    if pct is None or reps is None:
+        fb_pct, fb_reps, fb_sets = _apply_fallback(pd.Series(r._asdict()), fallback_matrix)
+        pct = fb_pct if pct is None else pct
+        reps = fb_reps if reps is None else reps
+        # neem fb_sets als default voor Sets (alleen informatief)
+        if fb_sets is not None and "Sets" in template.columns:
+            pass
+
+    # Veiligheidsmarge op %1RM
+    if pct is not None and safety_delta != 0.0:
+        pct = max(0.0, pct + float(safety_delta))
+
+    # Doel-kg
+    e1 = _safe_float(getattr(r, "e1RM"))
+    tgt_kg = _calc_target_weight(e1, pct, kg_step, round_mode) if (e1 is not None and pct is not None) else None
+
+    out_rows.append({
+        "Workout": workout,
+        "Exercise": ex,
+        "SetNumber": setno,
+        "%1RM": pct,
+        "Reps": reps,
+        "TargetKg": tgt_kg,
+        "e1RM": e1,
+        "SetsOverride": sets_override
+    })
+
+plan = pd.DataFrame(out_rows)
+
+# Indien SetsOverride aanwezig is, toon precies zoveel set-blokken als override
+def _apply_sets_override_to_display(df: pd.DataFrame) -> pd.DataFrame:
+    out = []
+    for ex, grp in df.groupby("Exercise", sort=False):
+        max_set = grp["SetNumber"].max()
+        override_vals = grp["SetsOverride"].dropna()
+        if not override_vals.empty and override_vals.iloc[0] and override_vals.iloc[0] > 0:
+            n_sets = int(override_vals.iloc[0])
+        else:
+            n_sets = int(max_set)
+        # Neem de eerste n_sets sets; indien minder rijen dan n_sets, vul aan door laatste set te kopiëren
+        g = grp.sort_values("SetNumber").copy()
+        if len(g) >= n_sets:
+            g = g.head(n_sets)
+        else:
+            if len(g) > 0:
+                last = g.iloc[-1].to_dict()
+                for s in range(len(g)+1, n_sets+1):
+                    last["SetNumber"] = s
+                    g = pd.concat([g, pd.DataFrame([last])], ignore_index=True)
+        out.append(g)
+    return pd.concat(out, ignore_index=True) if out else df
+
+plan_disp = _apply_sets_override_to_display(plan)
+
+# ==============================
+# ---------- Styling ----------
+# ==============================
+
+CUSTOM_CSS = """
+<style>
+.section-title {
+    margin-top: 0.5rem;
+    margin-bottom: 0.25rem;
+    font-size: 1.25rem;
+    font-weight: 700;
+}
+.exercise-card {
+    padding: 0.75rem 1rem;
+    margin: 0.25rem 0 0.75rem 0;
+    border-radius: 12px;
+    border: 1px solid rgba(120,120,120,0.25);
+    background: linear-gradient(180deg, rgba(250,250,250,0.9), rgba(245,245,245,0.9));
+}
+.set-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 12px;
+}
+.set-card {
+    border: 1px solid rgba(100,100,100,0.25);
+    border-radius: 12px;
+    padding: 14px;
+    background: #ffffff;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+}
+.set-header {
+    font-weight: 700;
+    font-size: 0.95rem;
+    margin-bottom: 6px;
+}
+.kv {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    row-gap: 6px;
+    column-gap: 12px;
+    font-size: 0.95rem;
+}
+.kv .k { color: #555; }
+.kv .v { font-weight: 700; }
+.badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: #124;
+    background: #e9f3ff;
+    border: 1px solid #cfe4ff;
+}
+.hint {
+    margin-top: 8px;
+    font-size: 0.8rem;
+    color: #666;
+}
+.divider {
+    height: 1px;
+    background: rgba(0,0,0,0.07);
+    margin: 8px 0 12px 0;
+}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# ==============================
+# ---------- Render ----------
+# ==============================
+
+# Groepeer per oefening binnen workout
+if plan_disp.empty:
+    st.warning("Geen adviesregels beschikbaar.")
+    st.stop()
+
+# Bovenaan: context
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric("Unieke oefeningen", plan_disp["Exercise"].nunique())
+with c2:
+    st.metric("Totaal set-blokken", len(plan_disp))
+with c3:
+    st.metric("Lookback (weken)", lookback_weeks)
+with c4:
+    st.metric("Ronding (kg)", kg_step)
+
+# Render per oefening
+for ex, grp in plan_disp.groupby("Exercise", sort=False):
+    grp = grp.sort_values("SetNumber")
+    e1 = grp["e1RM"].dropna().max()
+    header = f"{ex}  "
+    sub = f"(e1RM: {e1:.1f} kg)" if e1 is not None and not np.isnan(e1) else "(e1RM: onbekend)"
+    st.markdown(f"<div class='section-title'>{header}<span class='badge'>{sub}</span></div>", unsafe_allow_html=True)
+    st.markdown("<div class='exercise-card'>", unsafe_allow_html=True)
+
+    # Grid van set-kaarten
+    st.markdown("<div class='set-grid'>", unsafe_allow_html=True)
+    for r in grp.itertuples(index=False):
+        pct = getattr(r, "_1RM") if hasattr(r, "_1RM") else getattr(r, "%1RM")
+        reps = getattr(r, "Reps")
+        tgt = getattr(r, "TargetKg")
+        setn = getattr(r, "SetNumber")
+
+        # Kaart
+        st.markdown("<div class='set-card'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='set-header'>Set {int(setn)}</div>", unsafe_allow_html=True)
+        # key-values
+        st.markdown("<div class='kv'>", unsafe_allow_html=True)
+        st.markdown("<div class='k'>%1RM</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='v'>{'' if pct is None else f'{pct:.0f}%'}</div>", unsafe_allow_html=True)
+        st.markdown("<div class='k'>Reps</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='v'>{'' if reps is None else int(reps)}</div>", unsafe_allow_html=True)
+        st.markdown("<div class='k'>Doel-kg</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='v'>{'' if tgt is None or np.isnan(tgt) else f'{tgt:.1f} kg'}</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)  # kv
+
+        # Optionele hints/warm-ups
+        if show_warmups and (tgt is not None) and (tgt > 0):
+            # simpele ladder naar ~85%, 70%, 50% van doel
+            w3 = _round_weight(tgt * 0.85, kg_step, round_mode)
+            w2 = _round_weight(tgt * 0.70, kg_step, round_mode)
+            w1 = _round_weight(max(bar_weight, tgt * 0.50), kg_step, round_mode)
+            st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
+            st.markdown("<div class='hint'><b>Warm-up</b>: "
+                        f"{w1:.1f} × 5  →  {w2:.1f} × 3  →  {w3:.1f} × 1–2</div>", unsafe_allow_html=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)  # set-card
+    st.markdown("</div>", unsafe_allow_html=True)  # set-grid
+    st.markdown("</div>", unsafe_allow_html=True)  # exercise-card
+
+# ==============================
+# ---------- Exports ----------
+# ==============================
+
+with st.expander("Exporteren"):
+    # Exporteer het plan in 'platte' vorm als CSV voor logging/controle
+    exp = plan_disp.copy()
+    exp = exp[["Workout","Exercise","SetNumber","%1RM","Reps","TargetKg","e1RM","SetsOverride"]]
+    csv_bytes = exp.to_csv(index=False).encode("utf-8")
+    st.download_button("Download voorstel als CSV", data=csv_bytes, file_name="coaching_voorstel.csv", mime="text/csv")
+
     st.markdown(
-        "- LOW/OK/HIGH vergeleken met **10–20 sets/week**.\n"
-        "- **DUP** schaalt %1RM (H: 100%, M: 96%, L: 92%).\n"
-        "- Fallback-coaching per spiergroep, aangepast op weekstatus.\n"
-        "- Loads afgerond op **DB 2.0 kg** / **bar 2.5 kg**.\n"
-        "- **4-week rolling average** begrenst volume-sprongen."
+        "- CSV is bedoeld als audit trail. De **kaart-weergave** hierboven is leidend voor de uitvoering.\n"
+        "- Pas instellingen aan (ronding, lookback, veiligheidsmarge) om de blokken realtime te herberekenen."
     )
